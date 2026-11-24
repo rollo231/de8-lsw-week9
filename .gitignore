@@ -3,3 +3,5 @@ __pycache__/
 .env
 *.pem
 .DS_Store
+# captures go into the submission ZIP only (they show account id / IPs)
+capture/
