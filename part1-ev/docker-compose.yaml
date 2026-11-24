@@ -1,0 +1,172 @@
+# metacode DE 8기 9주차 (lsw) — single EC2 t3.large (2 vCPU / 8 GiB)
+# Kafka 3 brokers (KRaft) + kafka-ui + Spark standalone (master/worker) + Airflow
+#
+# Run on the EC2 host from this directory:
+#   docker compose up -d --build
+#
+# AWS access: NO access keys anywhere. Every container reaches S3/Athena through the
+# EC2 IAM role de9-ec2-lsw via the instance metadata service (IMDSv2, hop limit 2).
+#
+# Host ports (security group allows only 22/8080/8081/8090 from my IP):
+#   8080 kafka-ui | 8081 Spark master UI | 8090 Airflow UI
+#   127.0.0.1:9092-9094 Kafka EXTERNAL listeners for host-side Python clients
+
+x-kafka-common: &kafka-common
+  image: apache/kafka:3.7.0
+  restart: unless-stopped
+  mem_limit: 768m
+  environment: &kafka-env
+    CLUSTER_ID: _hwx4xIladubXbg4LEmwtQ
+    KAFKA_PROCESS_ROLES: broker,controller          # KRaft combined mode, no ZooKeeper
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka1:9093,2@kafka2:9093,3@kafka3:9093
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    # INTERNAL = container network (brokers, kafka-ui, Spark)
+    # EXTERNAL = published to the EC2 host loopback (producer/consumer scripts)
+    KAFKA_LISTENERS: INTERNAL://:19092,CONTROLLER://:9093,EXTERNAL://:29092
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+    KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3       # __consumer_offsets survives a broker loss
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"        # topics are created explicitly (partitions/RF stated)
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+    KAFKA_HEAP_OPTS: -Xmx384m -Xms384m              # sheet: ~384 MiB heap per broker
+
+# Spark image = official apache/spark:3.5.3 (Python 3.8, Java 11, Hadoop 3.3.4)
+# + Kafka source jars + S3A jars baked in (no --packages / ivy download at runtime).
+# The same jar list is in part2-price/airflow/Dockerfile so the Airflow-side driver matches.
+x-spark-build: &spark-build
+  context: .
+  dockerfile_inline: |
+    FROM apache/spark:3.5.3
+    ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_2.12/3.5.3/spark-sql-kafka-0-10_2.12-3.5.3.jar /opt/spark/jars/
+    ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/spark/spark-token-provider-kafka-0-10_2.12/3.5.3/spark-token-provider-kafka-0-10_2.12-3.5.3.jar /opt/spark/jars/
+    ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/3.4.1/kafka-clients-3.4.1.jar /opt/spark/jars/
+    ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/2.11.1/commons-pool2-2.11.1.jar /opt/spark/jars/
+    ADD --chmod=644 https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar /opt/spark/jars/
+    ADD --chmod=644 https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar /opt/spark/jars/
+
+x-spark-common: &spark-common
+  build: *spark-build
+  image: de9-spark:3.5.3
+  restart: unless-stopped
+  volumes:
+    - ..:/opt/de9:ro                                # repo (scripts + data), read-only
+  environment: &spark-env
+    HOME: /opt/spark/work-dir                       # image user 'spark' has no home dir
+    AWS_REGION: ap-northeast-2
+    SPARK_NO_DAEMONIZE: "true"
+    SPARK_DAEMON_MEMORY: 256m
+
+services:
+  kafka1:
+    <<: *kafka-common
+    container_name: kafka1
+    hostname: kafka1
+    ports: ["127.0.0.1:9092:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka1:19092,EXTERNAL://localhost:9092
+    volumes: [kafka1-data:/var/lib/kafka/data]
+
+  kafka2:
+    <<: *kafka-common
+    container_name: kafka2
+    hostname: kafka2
+    ports: ["127.0.0.1:9093:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka2:19092,EXTERNAL://localhost:9093
+    volumes: [kafka2-data:/var/lib/kafka/data]
+
+  kafka3:
+    <<: *kafka-common
+    container_name: kafka3
+    hostname: kafka3
+    ports: ["127.0.0.1:9094:29092"]
+    environment:
+      <<: *kafka-env
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka3:19092,EXTERNAL://localhost:9094
+    volumes: [kafka3-data:/var/lib/kafka/data]
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    mem_limit: 512m
+    depends_on: [kafka1, kafka2, kafka3]
+    ports: ["8080:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_NAME: de9-cluster
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka1:19092,kafka2:19092,kafka3:19092
+      JAVA_OPTS: -Xmx256m
+
+  spark-master:
+    <<: *spark-common
+    container_name: spark-master
+    hostname: spark-master                          # driver host when submitting from here
+    mem_limit: 1280m                                # daemon 256m + Q4 streaming driver
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    ports: ["8081:8080"]
+
+  spark-worker:
+    <<: *spark-common
+    container_name: spark-worker
+    hostname: spark-worker
+    mem_limit: 2g
+    depends_on: [spark-master]
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      <<: *spark-env
+      SPARK_WORKER_CORES: 2
+      SPARK_WORKER_MEMORY: 1536m                    # sheet: ~1.5 GiB for the worker
+
+  airflow-postgres:
+    image: postgres:13
+    container_name: airflow-postgres
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow                    # local metadata DB, not exposed outside the compose network
+      POSTGRES_DB: airflow
+    volumes: [airflow-pg:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 5s
+      retries: 10
+
+  airflow:
+    build: ../part2-price/airflow                   # custom image: Airflow 2.10.5 (Python 3.8) + Java 11 + Spark 3.5.3
+    image: de9-airflow:2.10.5
+    container_name: airflow
+    hostname: airflow                               # driver host for SparkSubmitOperator (client mode)
+    restart: unless-stopped
+    mem_limit: 2g
+    depends_on:
+      airflow-postgres: {condition: service_healthy}
+      spark-master: {condition: service_started}
+    command: standalone                             # webserver + scheduler + triggerer in one container
+    ports: ["8090:8080"]
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__WEBSERVER__WORKERS: 2
+      AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+      AWS_DEFAULT_REGION: ap-northeast-2
+    volumes:
+      - ../part2-price/dags:/opt/airflow/dags
+      - ..:/opt/de9:ro
+      - airflow-logs:/opt/airflow/logs
+
+volumes:
+  kafka1-data:
+  kafka2-data:
+  kafka3-data:
+  airflow-pg:
+  airflow-logs:
