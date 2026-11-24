@@ -157,7 +157,9 @@ services:
       AIRFLOW__CORE__LOAD_EXAMPLES: "false"
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
       AIRFLOW__WEBSERVER__WORKERS: 2
-      AIRFLOW_CONN_SPARK_DEFAULT: spark://spark-master:7077
+      # JSON form on purpose: the Spark provider builds --master as "<host>:<port>", so the
+      # scheme must be part of host (URI form spark://spark-master:7077 would give "spark-master:7077").
+      AIRFLOW_CONN_SPARK_DEFAULT: '{"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
       AWS_DEFAULT_REGION: ap-northeast-2
     volumes:
       - ../part2-price/dags:/opt/airflow/dags
